@@ -169,33 +169,91 @@ ensure_directories() {
   chmod 700 "$CODEX_HOME_DIR" "$APP_DIR" 2>/dev/null || true
 }
 
-download_to_stdout() {
+download_to_file() {
   local url=$1
+  local destination=$2
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url"
+    curl -fsSL "$url" -o "$destination"
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO- "$url"
+    wget -qO "$destination" "$url"
   else
     die "需要 curl 或 wget 才能下载官方 Codex 安装器。"
   fi
 }
 
 install_latest_codex() {
+  local installer
   ensure_linux_platform
   ensure_codex_install_prerequisites
   ensure_directories
   info "正在从 OpenAI 官方安装器安装或更新最新版 Codex CLI..."
-  download_to_stdout "$OFFICIAL_CODEX_INSTALL_URL" | CODEX_NON_INTERACTIVE=1 CODEX_INSTALL_DIR="$BIN_DIR" sh
+  installer=$(mktemp "${TMPDIR:-/tmp}/codex-official-installer.XXXXXX")
+  if ! download_to_file "$OFFICIAL_CODEX_INSTALL_URL" "$installer" || [[ ! -s "$installer" ]]; then
+    rm -f "$installer"
+    die "下载 OpenAI 官方安装器失败。请检查网络后重试。"
+  fi
+  if ! CODEX_NON_INTERACTIVE=1 CODEX_INSTALL_DIR="$BIN_DIR" sh "$installer"; then
+    rm -f "$installer"
+    die "OpenAI 官方安装器执行失败。"
+  fi
+  rm -f "$installer"
   export PATH="$BIN_DIR:$PATH"
   command -v codex >/dev/null 2>&1 || die "官方安装器已结束，但找不到 codex 命令。"
   success "Codex CLI 已就绪：$(codex --version 2>/dev/null || printf '已安装')"
 }
 
+validate_managed_block() {
+  local file=$1
+  [[ -e "$file" || -L "$file" ]] || return 0
+  [[ -f "$file" && ! -L "$file" ]] || die "$file 不是普通文件。为避免覆盖现有 Shell 配置，脚本未作修改。"
+
+  if ! awk -v start="$BLOCK_START" -v end="$BLOCK_END" '
+    $0 == start {
+      if (inside || start_count > 0) bad = 1
+      inside = 1
+      start_count++
+      next
+    }
+    $0 == end {
+      if (!inside || end_count > 0) bad = 1
+      inside = 0
+      end_count++
+      next
+    }
+    END {
+      if (bad || inside || start_count != end_count) exit 1
+    }
+  ' "$file"; then
+    die "检测到 $file 中的 Codex Easy Setup 标记不完整或重复。为避免覆盖你的 Shell 配置，脚本未作修改；请先手动修复这两个标记。"
+  fi
+}
+
+backup_shell_file() {
+  local file=$1
+  local stamp
+  local backup
+  stamp=$(date +%Y%m%d-%H%M%S)
+  backup="$file.codex-easy-setup.backup.$stamp"
+  while [[ -e "$backup" ]]; do
+    backup="$file.codex-easy-setup.backup.$stamp.$RANDOM"
+  done
+  cp -p "$file" "$backup"
+  info "已备份现有 Shell 配置：$backup"
+}
+
 strip_managed_block() {
   local file=$1
   local temp
+  local existed=0
+  [[ -e "$file" ]] && existed=1
   touch "$file"
+  if grep -Fqx "$BLOCK_START" "$file"; then
+    backup_shell_file "$file"
+  fi
   temp=$(mktemp "${file}.XXXXXX")
+  if [[ $existed -eq 1 ]]; then
+    chmod --reference="$file" "$temp" 2>/dev/null || true
+  fi
   awk -v start="$BLOCK_START" -v end="$BLOCK_END" '
     $0 == start { inside = 1; next }
     $0 == end { inside = 0; next }
@@ -219,6 +277,11 @@ strip_managed_block() {
 }
 
 install_shell_startup() {
+  validate_managed_block "$HOME/.profile"
+  validate_managed_block "$HOME/.bashrc"
+  if [[ -f "$HOME/.zshrc" || -L "$HOME/.zshrc" ]]; then
+    validate_managed_block "$HOME/.zshrc"
+  fi
   strip_managed_block "$HOME/.profile"
   strip_managed_block "$HOME/.bashrc"
   if [[ -f "$HOME/.zshrc" ]]; then
@@ -254,6 +317,30 @@ is_single_line() {
 
 is_valid_reasoning_effort() {
   [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+}
+
+reasoning_options_for_model() {
+  case $1 in
+    gpt-5.6|gpt-5.6-sol|gpt-5.6-terra)
+      printf '%s' 'low / medium / high / xhigh / max / ultra'
+      ;;
+    gpt-5.6-luna)
+      printf '%s' 'low / medium / high / xhigh / max'
+      ;;
+    gpt-5.5|gpt-5.4|gpt-5.4-mini|gpt-5.2|codex-auto-review)
+      printf '%s' 'low / medium / high / xhigh'
+      ;;
+    *)
+      printf '%s' 'none / minimal / low / medium / high / xhigh / max / ultra（或中转站要求的自定义值）'
+      ;;
+  esac
+}
+
+default_reasoning_for_model() {
+  case $1 in
+    gpt-5.6|gpt-5.6-sol) printf '%s' 'low' ;;
+    *) printf '%s' 'medium' ;;
+  esac
 }
 
 toml_quote() {
@@ -355,7 +442,9 @@ load_current_settings() {
   CURRENT_BASE_URL=$(extract_table_value "model_providers.$PROVIDER_ID" "base_url")
 
   : "${CURRENT_MODEL:=gpt-5.6}"
-  : "${CURRENT_REASONING:=medium}"
+  if [[ -z "$CURRENT_REASONING" ]]; then
+    CURRENT_REASONING=$(default_reasoning_for_model "$CURRENT_MODEL")
+  fi
   : "${CURRENT_SANDBOX:=workspace-write}"
   : "${CURRENT_APPROVAL:=on-request}"
   : "${CURRENT_NETWORK:=true}"
@@ -416,17 +505,20 @@ ask_yes_no() {
 }
 
 ask_reasoning() {
-  local default_value=$1
+  local model=$1
+  local default_value=$2
   local answer
+  local options
+  options=$(reasoning_options_for_model "$model")
   while true; do
-    printf '模型思考强度 none / minimal / low / medium / high / xhigh / max / ultra（也可输入中转站自定义值）[%s]: ' "$default_value" >&2
+    printf '模型思考强度 %s [%s]: ' "$options" "$default_value" >&2
     IFS= read -r answer
     answer=${answer:-$default_value}
     if is_valid_reasoning_effort "$answer"; then
       CONFIG_REASONING=$answer
       return 0
     fi
-    warn "请输入 none、minimal、low、medium、high、xhigh、max、ultra，或中转站给出的不含空格的自定义值。"
+    warn "请输入不含空格的思考强度。实际可用值取决于所选模型和中转站。"
   done
 }
 
@@ -439,7 +531,7 @@ normalize_base_url() {
 }
 
 is_valid_base_url() {
-  [[ $1 =~ ^https?://[^[:space:]]+$ ]]
+  [[ $1 =~ ^https://[^[:space:]]+$ ]]
 }
 
 prompt_security() {
@@ -470,13 +562,13 @@ prompt_provider_and_model() {
     if is_valid_base_url "$CONFIG_BASE_URL"; then
       break
     fi
-    warn "地址必须以 http:// 或 https:// 开头，且不能包含空格。"
+    warn "地址必须以 https:// 开头，且不能包含空格。"
   done
 
   ask_text CONFIG_PROVIDER_NAME "中转站名称（只用于 Codex 设置展示）" "$CURRENT_PROVIDER_NAME"
   [[ -n "$CONFIG_PROVIDER_NAME" ]] || die "中转站名称不能为空。"
 
-  ask_text CONFIG_MODEL "模型名称" "$CURRENT_MODEL"
+  ask_text CONFIG_MODEL "模型名称（OpenAI 当前推荐 gpt-5.6；中转站请填其实际模型名）" "$CURRENT_MODEL"
   [[ -n "$CONFIG_MODEL" ]] || die "模型名称不能为空。"
 
   if [[ -n "$CURRENT_API_KEY" ]]; then
@@ -495,7 +587,7 @@ prompt_provider_and_model() {
   fi
 
   while true; do
-    if ask_yes_no "请求格式是 Responses API 吗？Codex 当前只支持 Responses" "y"; then
+    if ask_yes_no "中转站是否明确支持 Responses API（/v1/responses）？Codex 只支持这个格式" "y"; then
       break
     fi
     warn "无法写入 Chat Completions 配置。请使用支持 /v1/responses 的 API 或中转站。"
@@ -504,7 +596,7 @@ prompt_provider_and_model() {
     fi
   done
 
-  ask_reasoning "$CURRENT_REASONING"
+  ask_reasoning "$CONFIG_MODEL" "$CURRENT_REASONING"
 }
 
 filter_existing_config() {
@@ -673,9 +765,9 @@ configure_model_interactive() {
   MANAGE_MODEL=1
   MANAGE_PROVIDER=0
   MANAGE_SECURITY=0
-  ask_text CONFIG_MODEL "模型名称" "$CURRENT_MODEL"
+  ask_text CONFIG_MODEL "模型名称（OpenAI 当前推荐 gpt-5.6；中转站请填其实际模型名）" "$CURRENT_MODEL"
   [[ -n "$CONFIG_MODEL" ]] || die "模型名称不能为空。"
-  ask_reasoning "$CURRENT_REASONING"
+  ask_reasoning "$CONFIG_MODEL" "$CURRENT_REASONING"
   write_config
   finish_configuration
 }
@@ -714,6 +806,7 @@ show_status() {
 
 doctor() {
   local failed=0
+  load_current_settings
   info "检查本地安装和配置..."
   if missing_codex_install_prerequisites; then
     warn "更新 Codex 所需的基础工具不完整；重新运行 install.sh 会尝试自动补齐。"
@@ -731,6 +824,18 @@ doctor() {
     success "配置文件存在：$CONFIG_FILE"
   else
     warn "未找到 config.toml。"
+    failed=1
+  fi
+  if is_valid_reasoning_effort "$CURRENT_REASONING"; then
+    success "思考强度格式有效：$CURRENT_REASONING（实际可用值取决于模型和中转站）"
+  else
+    warn "当前思考强度不受支持：$CURRENT_REASONING。请运行 codex-setup，选择模型和思考强度后重新保存。"
+    failed=1
+  fi
+  if is_valid_base_url "$CURRENT_BASE_URL"; then
+    success "API 地址使用 HTTPS。"
+  else
+    warn "当前 API 地址不是 HTTPS：$CURRENT_BASE_URL。请运行 codex-setup 后改为 HTTPS 地址。"
     failed=1
   fi
   if [[ -f "$SECRET_FILE" ]]; then
@@ -761,16 +866,18 @@ configure_noninteractive() {
   : "${CODEX_EASY_PROVIDER_NAME:?CODEX_EASY_PROVIDER_NAME is required}"
   : "${CODEX_EASY_MODEL:?CODEX_EASY_MODEL is required}"
   : "${CODEX_EASY_API_KEY:?CODEX_EASY_API_KEY is required}"
-  : "${CODEX_EASY_REASONING_EFFORT:=medium}"
+  : "${CODEX_EASY_REASONING_EFFORT:=}"
   : "${CODEX_EASY_SANDBOX_MODE:=workspace-write}"
   : "${CODEX_EASY_APPROVAL_POLICY:=on-request}"
   : "${CODEX_EASY_NETWORK_ACCESS:=true}"
   : "${CODEX_EASY_RESPONSES_API:=yes}"
 
-  is_valid_base_url "$CODEX_EASY_BASE_URL" || die "CODEX_EASY_BASE_URL 必须是 http(s) 地址。"
+  is_valid_base_url "$CODEX_EASY_BASE_URL" || die "CODEX_EASY_BASE_URL 必须是 https 地址。"
   is_single_line "$CODEX_EASY_PROVIDER_NAME" || die "CODEX_EASY_PROVIDER_NAME 不能包含换行符。"
   is_single_line "$CODEX_EASY_MODEL" || die "CODEX_EASY_MODEL 不能包含换行符。"
-  is_valid_reasoning_effort "$CODEX_EASY_REASONING_EFFORT" || die "无效的 CODEX_EASY_REASONING_EFFORT。"
+  if [[ -n "$CODEX_EASY_REASONING_EFFORT" ]]; then
+    is_valid_reasoning_effort "$CODEX_EASY_REASONING_EFFORT" || die "无效的 CODEX_EASY_REASONING_EFFORT。"
+  fi
   case $CODEX_EASY_SANDBOX_MODE in read-only|workspace-write|danger-full-access) ;; *) die "无效的 CODEX_EASY_SANDBOX_MODE。" ;; esac
   case $CODEX_EASY_APPROVAL_POLICY in untrusted|on-request|never) ;; *) die "无效的 CODEX_EASY_APPROVAL_POLICY。" ;; esac
   case $CODEX_EASY_NETWORK_ACCESS in true|false) ;; *) die "CODEX_EASY_NETWORK_ACCESS 必须是 true 或 false。" ;; esac
@@ -784,7 +891,11 @@ configure_noninteractive() {
   CONFIG_PROVIDER_NAME=$CODEX_EASY_PROVIDER_NAME
   CONFIG_MODEL=$CODEX_EASY_MODEL
   CONFIG_API_KEY=$CODEX_EASY_API_KEY
-  CONFIG_REASONING=$CODEX_EASY_REASONING_EFFORT
+  if [[ -n "$CODEX_EASY_REASONING_EFFORT" ]]; then
+    CONFIG_REASONING=$CODEX_EASY_REASONING_EFFORT
+  else
+    CONFIG_REASONING=$(default_reasoning_for_model "$CONFIG_MODEL")
+  fi
   CONFIG_SANDBOX=$CODEX_EASY_SANDBOX_MODE
   CONFIG_APPROVAL=$CODEX_EASY_APPROVAL_POLICY
   CONFIG_NETWORK=$CODEX_EASY_NETWORK_ACCESS

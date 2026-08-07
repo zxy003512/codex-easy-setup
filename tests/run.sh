@@ -30,6 +30,10 @@ multi_agent = false
 [model_providers]
 EOF
 
+cat > "$TEST_HOME/.bashrc" <<'EOF'
+export TEST_USER_SETTING=preserved
+EOF
+
 bash -n "$ROOT_DIR/install.sh"
 
 HOME="$TEST_HOME" \
@@ -81,6 +85,7 @@ fi
 
 assert_contains 'export CODEX_EASY_API_KEY=test-key-123' "$SECRET_FILE"
 assert_contains '# >>> codex-easy-setup >>>' "$TEST_HOME/.bashrc"
+assert_contains 'export TEST_USER_SETTING=preserved' "$TEST_HOME/.bashrc"
 if ! grep -F 'update|--update' "$ROOT_DIR/install.sh" >/dev/null; then
   printf '%s\n' 'Launcher update dispatch is missing.' >&2
   exit 1
@@ -111,6 +116,11 @@ if [[ $(grep -Fxc '[model_providers.codex_easy]' "$CONFIG_FILE") -ne 1 ]]; then
   exit 1
 fi
 
+if ! compgen -G "$TEST_HOME/.bashrc.codex-easy-setup.backup.*" >/dev/null; then
+  printf '%s\n' 'Expected Shell startup backup was not created.' >&2
+  exit 1
+fi
+
 python3 - "$CONFIG_FILE" <<'PY'
 import sys
 import tomllib
@@ -124,50 +134,110 @@ assert config["model_providers"]["codex_easy"]["wire_api"] == "responses"
 assert config["features"]["multi_agent"] is False
 PY
 
-HOME="$TEST_HOME" \
-CODEX_HOME="$TEST_CODEX_HOME" \
+DEFAULT_TEST_HOME="$TEMP_DIR/default-model-home"
+DEFAULT_TEST_CODEX_HOME="$DEFAULT_TEST_HOME/.codex"
+HOME="$DEFAULT_TEST_HOME" \
+CODEX_HOME="$DEFAULT_TEST_CODEX_HOME" \
 CODEX_EASY_BASE_URL="https://relay.example.test/v1" \
 CODEX_EASY_PROVIDER_NAME="Test Relay" \
-CODEX_EASY_MODEL="test-model-max" \
-CODEX_EASY_API_KEY="test-key-123" \
-CODEX_EASY_REASONING_EFFORT="max" \
-bash "$ROOT_DIR/install.sh" --non-interactive
+CODEX_EASY_MODEL="gpt-5.6" \
+CODEX_EASY_API_KEY="test-key-default" \
+CODEX_EASY_REASONING_EFFORT="" \
+bash "$ROOT_DIR/install.sh" --non-interactive >/dev/null
 
-assert_contains 'model = "test-model-max"' "$CONFIG_FILE"
-assert_contains 'model_reasoning_effort = "max"' "$CONFIG_FILE"
+assert_contains 'model_reasoning_effort = "low"' "$DEFAULT_TEST_CODEX_HOME/config.toml"
+
+assert_supported_reasoning_effort() {
+  local effort=$1
+  HOME="$TEST_HOME" \
+  CODEX_HOME="$TEST_CODEX_HOME" \
+  CODEX_EASY_BASE_URL="https://relay.example.test/v1" \
+  CODEX_EASY_PROVIDER_NAME="Test Relay" \
+  CODEX_EASY_MODEL="test-model-$effort" \
+  CODEX_EASY_API_KEY="test-key-123" \
+  CODEX_EASY_REASONING_EFFORT="$effort" \
+  bash "$ROOT_DIR/install.sh" --non-interactive >/dev/null
+  assert_contains "model_reasoning_effort = \"$effort\"" "$CONFIG_FILE"
+}
+
+for effort in none minimal low medium high xhigh max ultra relay-custom; do
+  assert_supported_reasoning_effort "$effort"
+done
+
+assert_invalid_reasoning_effort() {
+  local effort=$1
+  local exit_code
+  set +e
+  HOME="$TEST_HOME" \
+  CODEX_HOME="$TEST_CODEX_HOME" \
+  CODEX_EASY_BASE_URL="https://relay.example.test/v1" \
+  CODEX_EASY_PROVIDER_NAME="Test Relay" \
+  CODEX_EASY_MODEL="test-model-invalid-$effort" \
+  CODEX_EASY_API_KEY="test-key-123" \
+  CODEX_EASY_REASONING_EFFORT="$effort" \
+  bash "$ROOT_DIR/install.sh" --non-interactive >/dev/null 2>&1
+  exit_code=$?
+  set -e
+  if [[ $exit_code -eq 0 ]]; then
+    printf 'Unsupported reasoning effort was accepted: %s\n' "$effort" >&2
+    exit 1
+  fi
+}
+
+assert_invalid_reasoning_effort 'invalid effort'
 
 set +e
 HOME="$TEST_HOME" \
 CODEX_HOME="$TEST_CODEX_HOME" \
-CODEX_EASY_BASE_URL="https://relay.example.test/v1" \
+CODEX_EASY_BASE_URL="http://relay.example.test/v1" \
 CODEX_EASY_PROVIDER_NAME="Test Relay" \
-CODEX_EASY_MODEL="test-model-ultra" \
+CODEX_EASY_MODEL="test-model-insecure-url" \
 CODEX_EASY_API_KEY="test-key-123" \
-CODEX_EASY_REASONING_EFFORT="ultra" \
-bash "$ROOT_DIR/install.sh" --non-interactive
-
-assert_contains 'model = "test-model-ultra"' "$CONFIG_FILE"
-assert_contains 'model_reasoning_effort = "ultra"' "$CONFIG_FILE"
-
-set +e
-HOME="$TEST_HOME" \
-CODEX_HOME="$TEST_CODEX_HOME" \
-CODEX_EASY_BASE_URL="https://relay.example.test/v1" \
-CODEX_EASY_PROVIDER_NAME="Test Relay" \
-CODEX_EASY_MODEL="test-model-invalid-effort" \
-CODEX_EASY_API_KEY="test-key-123" \
-CODEX_EASY_REASONING_EFFORT="invalid effort" \
+CODEX_EASY_REASONING_EFFORT="high" \
 bash "$ROOT_DIR/install.sh" --non-interactive >/dev/null 2>&1
-INVALID_EFFORT_EXIT=$?
+INSECURE_URL_EXIT=$?
 set -e
 
-if [[ $INVALID_EFFORT_EXIT -eq 0 ]]; then
-  printf '%s\n' 'Invalid reasoning effort with whitespace was accepted.' >&2
+if [[ $INSECURE_URL_EXIT -eq 0 ]]; then
+  printf '%s\n' 'Insecure HTTP API URL was accepted.' >&2
   exit 1
 fi
 
-assert_contains 'model = "test-model-ultra"' "$CONFIG_FILE"
-assert_contains 'model_reasoning_effort = "ultra"' "$CONFIG_FILE"
+assert_contains 'model = "test-model-relay-custom"' "$CONFIG_FILE"
+assert_contains 'model_reasoning_effort = "relay-custom"' "$CONFIG_FILE"
+
+MARKER_TEST_HOME="$TEMP_DIR/marker-test-home"
+MARKER_TEST_CODEX_HOME="$MARKER_TEST_HOME/.codex"
+mkdir -p "$MARKER_TEST_HOME"
+cat > "$MARKER_TEST_HOME/.bashrc" <<'EOF'
+export BEFORE_MARKER=1
+# >>> codex-easy-setup >>>
+export MUST_NOT_BE_REMOVED=1
+EOF
+
+set +e
+HOME="$MARKER_TEST_HOME" \
+CODEX_HOME="$MARKER_TEST_CODEX_HOME" \
+CODEX_EASY_BASE_URL="https://relay.example.test/v1" \
+CODEX_EASY_PROVIDER_NAME="Test Relay" \
+CODEX_EASY_MODEL="test-model-marker" \
+CODEX_EASY_API_KEY="test-key-marker" \
+CODEX_EASY_REASONING_EFFORT="medium" \
+bash "$ROOT_DIR/install.sh" --non-interactive >/dev/null 2>&1
+MARKER_EXIT=$?
+set -e
+
+if [[ $MARKER_EXIT -eq 0 ]]; then
+  printf '%s\n' 'Malformed Shell startup marker was accepted.' >&2
+  exit 1
+fi
+
+assert_contains 'export BEFORE_MARKER=1' "$MARKER_TEST_HOME/.bashrc"
+assert_contains 'export MUST_NOT_BE_REMOVED=1' "$MARKER_TEST_HOME/.bashrc"
+if [[ -e "$MARKER_TEST_HOME/.profile" ]]; then
+  printf '%s\n' 'Shell startup files were partially modified after marker validation failed.' >&2
+  exit 1
+fi
 
 FAKE_BIN="$TEMP_DIR/fake-bin"
 FAKE_INSTALL_LOG="$TEMP_DIR/fake-codex-installs.log"
@@ -186,7 +256,8 @@ chmod 700 "$FAKE_BIN/uname"
 
 cat > "$FAKE_BIN/curl" <<'EOF'
 #!/usr/bin/env bash
-cat <<'INSTALLER'
+output_file=${!#}
+cat > "$output_file" <<'INSTALLER'
 #!/bin/sh
 set -eu
 mkdir -p "$CODEX_INSTALL_DIR"
@@ -204,7 +275,7 @@ INSTALLER
 EOF
 chmod 700 "$FAKE_BIN/curl"
 
-if ! printf '%s\n' n y n 'https://relay.example.test/v1' 'Test Relay' 'test-model-launcher' 'test-key-launcher' y max |
+if ! printf '%s\n' n y n 'https://relay.example.test/v1' 'Test Relay' 'test-model-launcher' 'test-key-launcher' y xhigh |
   HOME="$TEST_HOME" \
   CODEX_HOME="$TEST_CODEX_HOME" \
   CODEX_EASY_TEST_INSTALL_LOG="$FAKE_INSTALL_LOG" \
@@ -214,7 +285,7 @@ if ! printf '%s\n' n y n 'https://relay.example.test/v1' 'Test Relay' 'test-mode
   exit 1
 fi
 
-assert_contains 'model_reasoning_effort = "max"' "$CONFIG_FILE"
+assert_contains 'model_reasoning_effort = "xhigh"' "$CONFIG_FILE"
 
 HOME="$TEST_HOME" \
 CODEX_HOME="$TEST_CODEX_HOME" \
